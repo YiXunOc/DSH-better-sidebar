@@ -97,6 +97,7 @@ describe('turn-tail interception registration (issue #15)', () => {
     expect(fake.registered).toHaveLength(1)
     const { options, component } = fake.registered[0]!
     expect(options.name).toBe('conversation.chat.turnTail')
+    expect(options.id).toBe('dsh-better-sidebar:turn-tail')
     expect(options.priority).toBe(-1)
     expect(options.registrant).toBe('dsh-better-sidebar')
     expect(options.select).toBeTypeOf('function')
@@ -185,15 +186,16 @@ describe('turn-tail interception registration (issue #15)', () => {
       title: 'a.ts',
       path: '/w/src/a.ts',
       id: 'editor:/w/src/a.ts',
-    })
+    }, { sessionId: 's1', cwd: '/w' })
 
     // The show-in-folder seat reveals the produced files in the files window
     // (the editor home tab) — the panel expands and the rows highlight.
     expect(seat.onShowInFolder).toBeTypeOf('function')
     seat.onShowInFolder(['/w/src/a.ts'])
-    expect(ctx.betterSidebar.openTab).toHaveBeenLastCalledWith(expect.objectContaining({
-      type: 'editor',
-    }))
+    expect(ctx.betterSidebar.openTab).toHaveBeenLastCalledWith(
+      expect.objectContaining({ type: 'editor' }),
+      { sessionId: 's1', cwd: '/w' },
+    )
 
     restore()
   })

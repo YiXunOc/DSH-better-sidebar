@@ -21,7 +21,7 @@ export function openSidebarFile(ctx: Context, store: SidebarStore, sessionId: st
   const title = at === -1 ? absolute : absolute.slice(at + 1)
   // Route through the sidebar service so the editor descriptor's dedupeKey
   // (per-path) applies; the id is path-derived so multiple editors coexist.
-  ctx.get('betterSidebar')?.openTab({ type: 'editor', title, path: absolute, id: `editor:${absolute}` })
+  ctx.get('betterSidebar')?.openTab({ type: 'editor', title, path: absolute, id: `editor:${absolute}` }, { sessionId, cwd: summary?.cwd })
 }
 
 /**
@@ -48,7 +48,7 @@ export function revealInExplorer(
   // reveal highlight renders. Read via ctx.get like every other internal
   // consumer (#357): the provider is not on this fiber chain, so a direct
   // ctx.betterSidebar read can throw before optional chaining applies.
-  ctx.get('betterSidebar')?.openTab({ type: 'editor', title: t('files') })
+  ctx.get('betterSidebar')?.openTab({ type: 'editor', title: t('files') }, { sessionId, cwd })
 }
 
 /** The intercepted produced-files row (visual twin of the deliverables chips). */
@@ -112,6 +112,7 @@ export function SidebarProducedFiles(props: {
 export function registerTurnTailInterception(ctx: Context, store: SidebarStore): () => void {
   return ctx.slots.inject('conversation.chat.turnTail', () => ctx.slots.register({
     name: 'conversation.chat.turnTail',
+    id: 'dsh-better-sidebar:turn-tail',
     // Decline the takeover while the editor tab type is disabled in the side
     // card settings: the produced-files row falls back to the default
     // deliverables behavior instead of offering chips that cannot open. Also

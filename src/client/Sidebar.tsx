@@ -29,6 +29,7 @@ import { useSyncExternalStore } from 'react'
 import clsx from 'clsx'
 import { IconCloseFill14, Tooltip } from '@deepseek-ai/dsh-client-ui-primitives'
 import type { Context } from '../context-types.ts'
+import { EMPTY_MAIN_SESSION, EMPTY_SESSION_SUBSCRIBE, mainSessionSource } from './session-source.ts'
 import { referenceInChat as referenceInChatShared } from './reference-in-chat.ts'
 import {
   BOTTOM_MIN, CONVERSATION_MIN, agentUuidOf, firstLeaf, isAgentTabId,
@@ -197,7 +198,12 @@ export function Sidebar(props: { ctx: Context; store: SidebarStore }) {
     useMemo(() => (callback: () => void) => ctx.sessions.list.subscribe(callback), [ctx]),
     useCallback(() => ctx.sessions.list.getSnapshot(), [ctx]),
   )
-  const current = sessionList.current
+  const mainSession = mainSessionSource(ctx)
+  const currentBinding = useSyncExternalStore(
+    mainSession?.subscribe ?? EMPTY_SESSION_SUBSCRIBE,
+    mainSession?.getSnapshot ?? (() => EMPTY_MAIN_SESSION),
+  )
+  const current = currentBinding.props?.sessionId ?? sessionList.current
 
   // Per-session sidebar state.
   const snapshot = useSyncExternalStore(
@@ -333,7 +339,7 @@ export function Sidebar(props: { ctx: Context; store: SidebarStore }) {
     // Land the tab in the bottom panel's first pane; the once-flag is set
     // atomically so later expansions never repeat the auto-open.
     store.reduce(s => ({ ...s, activePane: firstLeaf(s.bottomSplits).id, bottomOpenedOnce: true }))
-    ctx.get('betterSidebar')?.openTab({ type: 'terminal', target: 'bottom' })
+    if (sessionId !== undefined) ctx.get('betterSidebar')?.openTab({ type: 'terminal', target: 'bottom' }, { sessionId, cwd })
   }, [state, store, ctx])
 
   // The bottom panel's height drag (top edge strip). Drags write the size

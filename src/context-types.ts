@@ -340,6 +340,15 @@ export interface SidebarSessionList {
   jobsBySession?: Readonly<Record<string, readonly SidebarJobView[]>>
 }
 
+export interface SidebarUiSessionService {
+  adapter: {
+    current: {
+      getSnapshot(): { props?: { sessionId?: string } }
+      subscribe(listener: () => void): () => void
+    }
+  }
+}
+
 /** The client sessions service face (only the list feed is needed). */
 export interface SidebarSessionsService {
   list: {
@@ -506,6 +515,8 @@ export interface SidebarContextShape {
   webServer: SidebarWebServer
   /** The session store (host `.get`) and the client list feed (`.list`) faces. */
   sessions: SidebarSessionStore & SidebarSessionsService
+  /** Session-scoped UI source; older hosts may omit it. */
+  uiSession?: SidebarUiSessionService
   /** The web runtime trust list (bind-derived). */
   webRuntime: SidebarWebRuntime
   /** The client slot registry (register/inject). */

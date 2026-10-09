@@ -7,6 +7,7 @@
  */
 import { useEffect, useRef } from 'react'
 import type { Context, SidebarSessionList } from '../../context-types.ts'
+import { activeSessionId } from '../session-source.ts'
 import { mirrorAgentWaits, reconcileAgentTerminals, type SidebarStore } from '../state.ts'
 import { isNarrowWidth } from '../breakpoints.ts'
 import { detectNewDirectSubagent } from '../subagent-detect.ts'
@@ -67,7 +68,7 @@ function activateTasksPage(ctx: Context, sessionId: string, options: { backgroun
   const park = options.background
     // The face acts on the MOUNTED session: parking is only meaningful (and
     // only safe) when the activation targets the one on screen.
-    && ctx.sessions.list.getSnapshot().current === sessionId
+    && activeSessionId(ctx) === sessionId
     && isNarrowWidth(window.innerWidth)
     // Only a column the user had COLLAPSED is put back: an expanded one is in
     // use, and closing it under the user would be worse than the takeover.

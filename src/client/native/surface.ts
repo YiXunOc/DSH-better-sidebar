@@ -20,6 +20,7 @@ import type { Context } from '../../context-types.ts'
 import { fileAddressFor } from '../resource-address.ts'
 import type { NativeTabParams, SidebarSurface } from '../service.ts'
 import type { NativeTabRecords } from './tab-adapter.tsx'
+import { activeSessionId, mainSessionSource } from '../session-source.ts'
 
 /** One open the surface could not place yet. */
 type Pending =
@@ -43,15 +44,6 @@ export interface NativeSurface extends SidebarSurface {
   flushPending(): void
   /** Stop observing the session list. */
   dispose(): void
-}
-
-/** The active session id, as the client list reports it. */
-function activeSessionId(ctx: Context): string | undefined {
-  try {
-    return ctx.sessions.list.getSnapshot().current
-  } catch {
-    return undefined
-  }
 }
 
 /**
@@ -109,7 +101,8 @@ export function createNativeSurface(ctx: Context, records: NativeTabRecords): Na
     if (!place(entry)) pending.push(entry)
   }
 
-  const unsubscribe = ctx.sessions.list.subscribe(flushPending)
+  const unsubscribeList = ctx.sessions.list.subscribe(flushPending)
+  const unsubscribeMain = mainSessionSource(ctx)?.subscribe(flushPending)
   return {
     openTab({ sessionId, kind, params, revealIfOpened }) {
       enqueue({ kind: 'tab', sessionId, tabKind: kind, params, revealIfOpened })
@@ -144,6 +137,6 @@ export function createNativeSurface(ctx: Context, records: NativeTabRecords): Na
     },
     has: tabId => records.has(tabId),
     flushPending,
-    dispose: () => { unsubscribe() },
+    dispose: () => { unsubscribeList(); unsubscribeMain?.() },
   }
 }
