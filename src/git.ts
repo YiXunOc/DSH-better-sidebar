@@ -675,13 +675,11 @@ export async function branches(cwd: string, selected?: string): Promise<{ curren
   return { current, names: names.includes(current) ? names : [current, ...names] }
 }
 
-/** Switch to an existing branch.
- *  `--end-of-options` precedes the operand: without it a caller-supplied
- *  branch beginning with `-` is parsed as an OPTION, so `-f` force-discarded
- *  the worktree changes and `--work-tree=…` redirected the checkout. Same
- *  guard as show / commitDiff / revert / cherryPick (4100e16). */
+/** Switch to an existing branch without parsing caller input as an option.
+ *  `switch --no-guess --` rejects hostile operands and prevents implicit remote
+ *  branch creation while keeping unsaved work under Git's ordinary guard. */
 export async function checkout(cwd: string, branch: string, selected?: string): Promise<void> {
-  await runGit(await repoRoot(cwd, selected), ['checkout', '--end-of-options', branch])
+  await runGit(await repoRoot(cwd, selected), ['switch', '--no-guess', '--', branch])
 }
 
 /** Recent commit history (newest first), lazily pageable via skip/count. */
