@@ -41,11 +41,12 @@
  * reason the mount lane runs first: a later lane's seeding must not change what
  * an earlier lane's tree shows.
  */
-import { mkdirSync, rmSync, writeFileSync } from 'node:fs'
+import { mkdirSync, writeFileSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { test, expect, type APIRequestContext, type Page } from '@playwright/test'
 import { PAGE_URL, createHostApi, hostRpc, sendFirstMessage } from './host'
+import { removeTree } from '../temp-tree.ts'
 
 /** This lane's own workspace: a 40-child directory plus a small sibling. */
 const WORKSPACE_PATH = process.env.DSH_E2E_EXPAND_WORKSPACE ?? join(tmpdir(), 'dsh-e2e-expand-probe')
@@ -64,7 +65,7 @@ function seedWorkspace(): void {
   // The lane owns this directory and every run starts from the same tree: a
   // leftover file from an earlier run would already be listed, so the
   // behind-the-plugin write below would change nothing on screen.
-  rmSync(WORKSPACE_PATH, { recursive: true, force: true })
+  removeTree(WORKSPACE_PATH)
   mkdirSync(join(WORKSPACE_PATH, BIG), { recursive: true })
   mkdirSync(join(WORKSPACE_PATH, 'bravo'), { recursive: true })
   for (let i = 0; i < BIG_CHILDREN; i++) {

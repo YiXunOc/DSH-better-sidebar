@@ -3,12 +3,13 @@
  * exercises the real integrations — route registration, git against the
  * actual repository, and a real directory listing. Runs with `pnpm test`.
  */
-import { describe, expect, it } from 'vitest'
+import { describe, expect, it, vi } from 'vitest'
 import { spawnSync } from 'node:child_process'
 import { mkdirSync, mkdtempSync, readFileSync, realpathSync, rmSync, symlinkSync, writeFileSync } from 'node:fs'
 import { tmpdir, homedir } from 'node:os'
 import { dirname, join, resolve as resolvePath } from 'node:path'
 import { SettingsConflictError, type SettingsNamespace } from '@deepseek-ai/dsh-settings'
+import { WebSocket } from 'ws'
 import { apply, FS_TREES_MAX_PATHS, mediaTypeForPath } from '../src/index.ts'
 import { SIDEBAR_PREFS_DEFAULTS } from '../src/prefs-shared.ts'
 import { encodeHtmlUrl } from '../src/html-route.ts'
@@ -17,6 +18,26 @@ import { downloadUrl, htmlUrl } from '../src/client/api.ts'
 import * as git from '../src/git.ts'
 import { listDirectory } from '../src/fs-tree.ts'
 import type { SidebarWebRoute, SidebarWebUpgradeRoute } from '../src/context-types.ts'
+import { removeTree } from './temp-tree.ts'
+
+/**
+ * The probe-budget factory is spied on so a batch's gate SHARING is asserted
+ * rather than assumed: `fs.trees` lists many levels at once and must build ONE
+ * gate per request, or the per-level probe bounds multiply. Everything else
+ * about the module stays real, so this file's own `listDirectory` calls (and
+ * every other route) behave exactly as before.
+ */
+const probeGateCalls = vi.hoisted(() => [] as unknown[][])
+vi.mock('../src/fs-tree.ts', async (importOriginal) => {
+  const actual = await importOriginal<typeof import('../src/fs-tree.ts')>()
+  return {
+    ...actual,
+    createProbeGate: (...args: Parameters<typeof actual.createProbeGate>) => {
+      probeGateCalls.push(args)
+      return actual.createProbeGate(...args)
+    },
+  }
+})
 
 /** Symlink creation may require elevated privileges on Windows. */
 const canCreateSymlink = (() => {
@@ -28,12 +49,12 @@ const canCreateSymlink = (() => {
   } catch {
     return false
   } finally {
-    rmSync(dir, { recursive: true, force: true })
+    removeTree(dir)
   }
 })()
 
 interface FakeContext {
-  webRuntime: { trustedHosts: readonly string[] }
+  webStartup: { trustedHosts: readonly string[] }
   webServer: {
     register: (route: SidebarWebRoute) => () => void
     registerUpgrade: (route: SidebarWebUpgradeRoute) => () => void
@@ -50,6 +71,19 @@ interface FakeContext {
   get: (key: string) => undefined
 }
 
+/**
+ * The routes the MOST RECENT mount registered, whichever helper produced them.
+ *
+ * The editor save moved from a JSON method on `/sidebar/api` to its own raw
+ * route (`/sidebar/write`, with the document as the request body). Every call
+ * site here still says `invoke(route, 'fs.write', ...)`, so the dispatcher
+ * needs a way back to the mount that produced `route` — recording the last one
+ * is far less noise than threading a second route reference through every
+ * case, and BOTH mount helpers write it so neither can leave a stale entry
+ * behind the other.
+ */
+let lastMountedRoutes: SidebarWebRoute[] = []
+
 describe('host plugin smoke', () => {
   it('serves PDF with the browser-native content type', () => {
     expect(mediaTypeForPath('/work/report.PDF')).toBe('application/pdf')
@@ -61,7 +95,7 @@ describe('host plugin smoke', () => {
     const upgrades: SidebarWebUpgradeRoute[] = []
     const effects: Array<() => void | (() => void)> = []
     const ctx: FakeContext = {
-      webRuntime: { trustedHosts: [] },
+      webStartup: { trustedHosts: [] },
       webServer: {
         register: (route) => { routes.push(route); return () => {} },
         registerUpgrade: (route) => { upgrades.push(route); return () => {} },
@@ -85,25 +119,85 @@ describe('host plugin smoke', () => {
     expect(routes.map(route => route.path)).toEqual([
       '/sidebar/api',
       '/sidebar/upload',
+      '/sidebar/write',
       '/sidebar/bundle',
       '/sidebar/archive',
       '/sidebar/file',
       '/sidebar/html',
     ])
-    expect(upgrades.map(route => route.path)).toEqual(['/sidebar/ws/agent-opens', '/sidebar/ws/fs-watch'])
+    expect(upgrades.map(route => route.path)).toEqual([
+      '/sidebar/ws/agent-opens',
+      '/sidebar/ws/fs-watch',
+      '/sidebar/ws/sidechat',
+    ])
     // Teardown runs without throwing.
     for (const cleanup of effects) cleanup()
   })
 
-  it('serves HTML previews as UTF-8 without changing the file bytes', async () => {
-    const directory = mkdtempSync(join(tmpdir(), 'dsh-sidebar-html-utf8-'))
+  /**
+   * Teardown must release the ACCEPTED sockets, not merely stop accepting new
+   * ones: `WebSocketServer.close()` on a `noServer` server does not terminate
+   * an already-upgraded socket under ws@8 (it sets `_shouldEmitClose` and
+   * waits), so without the explicit `wss.clients` close every fs-watch
+   * `fs.watch` handle and the agent-opens subscriber set survives the plugin
+   * unmount until the browser disconnects. The client here is a REAL ws
+   * connection through the registered upgrade handler.
+   */
+  it('closes the accepted push sockets on teardown', async () => {
+    const upgrades: SidebarWebUpgradeRoute[] = []
+    const effects: Array<() => void | (() => void)> = []
+    const ctx: FakeContext = {
+      webStartup: { trustedHosts: [] },
+      webServer: {
+        register: () => () => {},
+        registerUpgrade: (route) => { upgrades.push(route); return () => {} },
+      },
+      sessions: { get: () => undefined },
+      tools: { register: () => () => {} },
+      effect: (fn) => {
+        const cleanup = fn()
+        if (typeof cleanup === 'function') effects.push(cleanup)
+      },
+      inject: () => () => {},
+      on: () => () => {},
+      get: () => undefined,
+    }
+    apply(ctx as never)
+    const upgrade = upgrades.find(route => route.path === '/sidebar/ws/agent-opens')!
+    const { createServer } = await import('node:http')
+    const server = createServer()
+    server.on('upgrade', (req, socket, head) => {
+      upgrade.handler(req as never, socket as never, head as never)
+    })
+    await new Promise<void>((resolve) => { server.listen(0, '127.0.0.1', () => { resolve() }) })
+    const address = server.address()
+    if (address === null || typeof address === 'string') throw new Error('test setup: no server port')
+    const client = new WebSocket(`ws://127.0.0.1:${address.port}/sidebar/ws/agent-opens?sessionId=s-teardown`)
+    try {
+      await new Promise<void>((resolve, reject) => {
+        client.once('open', () => { resolve() })
+        client.once('error', reject)
+      })
+      const closed = new Promise<boolean>((resolve) => {
+        const timer = setTimeout(() => { resolve(false) }, 3_000)
+        client.once('close', () => { clearTimeout(timer); resolve(true) })
+      })
+      for (const cleanup of effects) cleanup()
+      expect(await closed).toBe(true)
+    } finally {
+      client.terminate()
+      await new Promise<void>((resolve) => { server.close(() => { resolve() }) })
+    }
+  })
+
+  it('serves HTML previews as UTF-8 without changing the file bytes', async () => {    const directory = mkdtempSync(join(tmpdir(), 'dsh-sidebar-html-utf8-'))
     const path = join(directory, 'fragment.html')
     const source = Buffer.from('<div>排序算法可视化</div>', 'utf8')
     writeFileSync(path, source)
     const routes: SidebarWebRoute[] = []
     const effects: Array<() => void | (() => void)> = []
     const ctx: FakeContext = {
-      webRuntime: { trustedHosts: [] },
+      webStartup: { trustedHosts: [] },
       webServer: {
         register: (route) => { routes.push(route); return () => {} },
         registerUpgrade: () => () => {},
@@ -121,30 +215,30 @@ describe('host plugin smoke', () => {
     try {
       apply(ctx as never)
       const route = routes.find(candidate => candidate.path === '/sidebar/html')!
-      const req = {
-        method: 'GET',
-        url: encodeHtmlUrl('s-html', path),
-        headers: { host: '127.0.0.1:3080' },
-      } as never
-      const response: { status?: number; headers?: Record<string, string>; chunks: Buffer[] } = { chunks: [] }
-      const res = {
-        writeHead: (status: number, headers?: Record<string, string>) => {
-          response.status = status
-          response.headers = headers
-        },
-        end: (chunk?: string | Buffer) => {
-          if (chunk !== undefined) response.chunks.push(Buffer.from(chunk))
-        },
-      } as never
-
-      await route.handler(req, res)
+      // Over a real socket: the route STREAMS its bytes now
+      // (`createReadStream` → `pipeline` into the response), which a
+      // plain-object response stub cannot accept as a Writable.
+      const { createServer } = await import('node:http')
+      const server = createServer((req, res) => { void route.handler(req as never, res as never) })
+      await new Promise<void>(resolve => server.listen(0, '127.0.0.1', resolve))
+      const address = server.address()
+      if (address === null || typeof address === 'string') throw new Error('test setup: no server port')
+      let response: Response
+      try {
+        response = await fetch(`http://127.0.0.1:${address.port}${encodeHtmlUrl('s-html', path)}`)
+      } finally {
+        await new Promise<void>(resolve => {
+          server.close(() => resolve())
+          server.closeAllConnections()
+        })
+      }
 
       expect(response.status).toBe(200)
-      expect(Buffer.concat(response.chunks)).toEqual(source)
-      expect(response.headers?.['content-type']).toBe('text/html; charset=utf-8')
+      expect(Buffer.from(await response.arrayBuffer())).toEqual(source)
+      expect(response.headers.get('content-type')).toBe('text/html; charset=utf-8')
     } finally {
       for (const cleanup of effects) cleanup()
-      rmSync(directory, { recursive: true, force: true })
+      removeTree(directory)
     }
   })
 
@@ -283,7 +377,7 @@ describe('git destructive operations (scratch repository)', () => {
       expect(staged).toContain('-two')
       expect(staged).toContain('+CHANGED')
     } finally {
-      rmSync(dir, { recursive: true, force: true })
+      removeTree(dir)
     }
   })
 
@@ -307,7 +401,7 @@ describe('git destructive operations (scratch repository)', () => {
       expect(readFileSync(join(dir, 'pkg', 'README.md'), 'utf8')).toBe('pkg-DIRTY\n')
       expect(gitRun(dir, ['status', '--porcelain'])).toBe(' M pkg/README.md\n')
     } finally {
-      rmSync(dir, { recursive: true, force: true })
+      removeTree(dir)
     }
   })
 
@@ -322,7 +416,7 @@ describe('git destructive operations (scratch repository)', () => {
       expect(readFileSync(join(dir, 'a.txt'), 'utf8')).toBe('one\ntwo\nthree\n')
       expect((await git.log(dir))[0]!.subject).toBe('Revert "change"')
     } finally {
-      rmSync(dir, { recursive: true, force: true })
+      removeTree(dir)
     }
   })
 
@@ -339,7 +433,7 @@ describe('git destructive operations (scratch repository)', () => {
       expect(readFileSync(join(dir, 'b.txt'), 'utf8')).toBe('feature work\n')
       expect((await git.log(dir))[0]!.subject).toBe('feature work')
     } finally {
-      rmSync(dir, { recursive: true, force: true })
+      removeTree(dir)
     }
   })
 
@@ -350,7 +444,7 @@ describe('git destructive operations (scratch repository)', () => {
       await expect(git.revert(dir, 'deadbeef00000000000000000000000000000000')).rejects.toThrow()
       await expect(git.cherryPick(dir, 'deadbeef00000000000000000000000000000000')).rejects.toThrow()
     } finally {
-      rmSync(dir, { recursive: true, force: true })
+      removeTree(dir)
     }
   })
 
@@ -373,7 +467,7 @@ describe('git destructive operations (scratch repository)', () => {
       await expect(git.revert(dir, '--abort')).rejects.toThrow()
       await expect(git.cherryPick(dir, '--abort')).rejects.toThrow()
     } finally {
-      rmSync(dir, { recursive: true, force: true })
+      removeTree(dir)
     }
   })
 
@@ -386,7 +480,7 @@ describe('git destructive operations (scratch repository)', () => {
       gitRun(dir, ['add', 'a.txt'])
       await expect(git.show(dir, ':0', 'a.txt')).resolves.toContain('staged-change')
     } finally {
-      rmSync(dir, { recursive: true, force: true })
+      removeTree(dir)
     }
   })
 })
@@ -399,8 +493,9 @@ describe('session cwd resolution over the API route', () => {
 
   const mountAll = (overrides: CtxOverrides = {}): SidebarWebRoute[] => {
     const routes: SidebarWebRoute[] = []
+    lastMountedRoutes = routes
     const ctx = {
-      webRuntime: { trustedHosts: [] },
+      webStartup: { trustedHosts: [] },
       webServer: {
         register: (route: SidebarWebRoute) => { routes.push(route); return () => {} },
         registerUpgrade: (route: SidebarWebUpgradeRoute) => { void route; return () => {} },
@@ -422,11 +517,17 @@ describe('session cwd resolution over the API route', () => {
 
   const mount = (overrides: CtxOverrides = {}): SidebarWebRoute => mountAll(overrides).find(route => route.path === '/sidebar/api')!
 
+  /** One save through the raw route (see the module-level `invokeRawWrite`). */
+  const invokeWrite = invokeRawWrite
+
   const invoke = async (
     route: SidebarWebRoute,
     method: string,
     payload: unknown,
   ): Promise<{ ok: boolean; status: number; value?: { cwd: string }; error?: { code?: string; message: string } }> => {
+    if (method === 'fs.write') {
+      return await invokeWrite(payload) as unknown as { ok: boolean; status: number; value?: { cwd: string } }
+    }
     const body = Buffer.from(JSON.stringify(payload))
     const req = {
       method: 'POST',
@@ -447,19 +548,41 @@ describe('session cwd resolution over the API route', () => {
     return (await invokeGetFull(route, url))
   }
 
-  /** invokeGet plus the response headers (for header contracts). */
+  /**
+   * invokeGet plus the response headers (for header contracts).
+   *
+   * Served over a REAL node:http server rather than a plain-object stub: the
+   * media and html routes STREAM now (`createReadStream` → `pipeline` into the
+   * response), and a fake response object with only `writeHead`/`end` cannot
+   * be a Writable. Going through a real socket also means the header
+   * assertions exercise node's own header validation, which is what caught the
+   * non-latin1 `Content-Disposition` case in the first place.
+   */
   const invokeGetFull = async (route: SidebarWebRoute, url: string): Promise<{ status: number; body: string; headers: Record<string, string> }> => {
-    const out: { status: number; body: string; headers: Record<string, string> } = { status: 200, body: '', headers: {} }
-    const req = { method: 'GET', url, headers: { host: '127.0.0.1:3080' } } as never
-    const res = {
-      writeHead: (status: number, headers?: Record<string, string>) => {
-        out.status = status
-        if (headers !== undefined) out.headers = headers
-      },
-      end: (chunk: unknown) => { out.body += String(chunk ?? '') },
-    } as never
-    await route.handler(req, res)
-    return out
+    const { createServer } = await import('node:http')
+    const server = createServer((req, res) => { void route.handler(req as never, res as never) })
+    await new Promise<void>(resolve => server.listen(0, '127.0.0.1', resolve))
+    try {
+      const address = server.address()
+      if (address === null || typeof address === 'string') throw new Error('test setup: no server port')
+      // The callers spell their URLs two ways (a bare path, and an absolute
+      // `http://dsh.internal/...` from the route helpers); only the path and
+      // query are meaningful against this ephemeral port.
+      const target = new URL(url, 'http://dsh.internal')
+      const response = await fetch(`http://127.0.0.1:${address.port}${target.pathname}${target.search}`, { redirect: 'manual' })
+      const headers: Record<string, string> = {}
+      response.headers.forEach((value, key) => { headers[key] = value })
+      return { status: response.status, body: await response.text(), headers }
+    } finally {
+      // undici keeps the connection alive, and a plain `close()` waits for it:
+      // without dropping the sockets first, each call would block until the
+      // client's keep-alive timeout and the whole case would crawl past the
+      // suite's test timeout.
+      await new Promise<void>(resolve => {
+        server.close(() => resolve())
+        server.closeAllConnections()
+      })
+    }
   }
 
   it('loads branches and history when switching child repositories and their linked checkouts', async () => {
@@ -504,7 +627,7 @@ describe('session cwd resolution over the API route', () => {
         expect(await invoke(route, 'git.log', { ...base, repoRoot: b, worktree })).toMatchObject({ ok: false })
       }
     } finally {
-      rmSync(scratch, { recursive: true, force: true })
+      removeTree(scratch)
     }
   })
 
@@ -551,7 +674,7 @@ describe('session cwd resolution over the API route', () => {
       expect(notRepo).toMatchObject({ ok: false, status: 409, error: { code: 'not-repo' } })
       expect(notRepo.error?.message).not.toContain('internal')
     } finally {
-      rmSync(dir, { recursive: true, force: true })
+      removeTree(dir)
     }
   })
 
@@ -654,7 +777,7 @@ describe('session cwd resolution over the API route', () => {
       expect(diff).toContain('+root-DIRTY')
       expect(diff).not.toContain('pkg-DIRTY')
     } finally {
-      rmSync(dir, { recursive: true, force: true })
+      removeTree(dir)
     }
   })
 
@@ -700,7 +823,7 @@ describe('session cwd resolution over the API route', () => {
       expect(value.path).toBe(outside)
       expect(value.entries.map(entry => entry.name)).toEqual(['secret.txt'])
     } finally {
-      rmSync(root, { recursive: true, force: true })
+      removeTree(root)
     }
   })
 
@@ -718,7 +841,7 @@ describe('session cwd resolution over the API route', () => {
       expect(read.ok).toBe(true)
       expect((read.value as unknown as { kind: string; content: string }).content).toBe('secret')
     } finally {
-      rmSync(root, { recursive: true, force: true })
+      removeTree(root)
     }
   })
 
@@ -735,7 +858,7 @@ describe('session cwd resolution over the API route', () => {
       expect(write.ok).toBe(true)
       expect(readFileSync(written, 'utf8')).toBe('hack')
     } finally {
-      rmSync(root, { recursive: true, force: true })
+      removeTree(root)
     }
   })
 
@@ -772,10 +895,14 @@ describe('session cwd resolution over the API route', () => {
       expect(await invokeGet(file, downloadUrl(scope, external)))
         .toMatchObject({ status: 200, body: '<p>external</p>' })
       rmSync(external)
-      expect((await invokeGet(html, htmlUrl(scope, external))).status).toBe(500)
-      expect((await invokeGet(file, downloadUrl(scope, external))).status).toBe(500)
+      // A path that cannot be opened is the route's own 4xx now, not a bare
+      // stat() rejection escaping as an internal 500: the stream helper opens
+      // the file BEFORE committing the response precisely so this stays a
+      // usable error envelope.
+      expect((await invokeGet(html, htmlUrl(scope, external))).status).toBe(400)
+      expect((await invokeGet(file, downloadUrl(scope, external))).status).toBe(400)
     } finally {
-      rmSync(root, { recursive: true, force: true })
+      removeTree(root)
     }
   })
 
@@ -800,7 +927,7 @@ describe('session cwd resolution over the API route', () => {
       const written = readFileSync(target, 'utf8')
       expect([draftA, draftB]).toContain(written)
     } finally {
-      rmSync(root, { recursive: true, force: true })
+      removeTree(root)
     }
   })
 
@@ -823,32 +950,41 @@ describe('session cwd resolution over the API route', () => {
       expect(write.ok).toBe(true)
       expect(readFileSync(target).equals(encodeText(text, 'gbk'))).toBe(true)
     } finally {
-      rmSync(root, { recursive: true, force: true })
+      removeTree(root)
     }
   })
 
-  it('fs.read keeps a capped CJK UTF-8 file UTF-8 (the cap cuts a character, #523)', async () => {
+  it('fs.read answers a CJK UTF-8 file past the editable threshold as too-large (#523)', async () => {
     const root = mkdtempSync(join(tmpdir(), 'dsh-sidebar-fs-readcap-'))
     const workspace = join(root, 'workspace')
     mkdirSync(workspace)
     try {
       const route = mount({ sessions: { get: () => ({ header: { cwd: workspace } }) } })
       const target = join(workspace, 'big.txt')
-      // The default 512 KiB readLimit lands two bytes into a three-byte
-      // character; the GBK probe accepts that partial tail, so the read used
-      // to come back as 涓枃-style mojibake.
-      writeFileSync(target, Buffer.from('中'.repeat(174_763), 'utf8'))
+      // This file used to be read with a 512 KiB cap that landed two bytes
+      // into a three-byte character; the GBK probe accepted that partial tail,
+      // so the read came back as 涓枃-style mojibake. There is no capped read
+      // any more — an over-limit document is refused as a document and served
+      // through the paged preview instead, which is what removes the whole
+      // class of bug: no truncated buffer ever reaches a decoder.
+      // Past the 5 MiB editable threshold (3 bytes per character, so a little
+      // over 1.75 M characters), which is what routes it to the paged preview.
+      const content = '中'.repeat(1_800_000)
+      expect(Buffer.byteLength(content, 'utf8')).toBeGreaterThan(5 * 1024 * 1024)
+      writeFileSync(target, Buffer.from(content, 'utf8'))
       const result = await invoke(route, 'fs.read', { sessionId: 'readcap', path: target })
-      const value = result.value as { kind?: string; content?: string; truncated?: boolean } | undefined
-      expect(value?.kind).toBe('text')
-      expect(value?.truncated).toBe(true)
-      // The known-good prefix reads as 中, with the usual replacement
-      // character for the cut tail — never as 涓枃 mojibake.
-      expect(value?.content?.startsWith('中中')).toBe(true)
-      expect(value?.content).not.toContain('涓')
-      expect(value?.content?.endsWith('\ufffd')).toBe(true)
+      const value = result.value as { kind?: string; size?: number; content?: string; head?: string } | undefined
+      expect(value?.kind).toBe('too-large')
+      expect(value?.size).toBe(Buffer.byteLength(content, 'utf8'))
+      // No document rides along — that is the point.
+      expect(value?.content).toBeUndefined()
+      // The 4 KiB sniff head still does, and it is valid UTF-8 including a
+      // whole number of characters (the reader takes a byte prefix, and the
+      // paged route is what reassembles text).
+      expect(typeof value?.head).toBe('string')
+      expect(Buffer.from(value!.head!, 'base64').length).toBe(4096)
     } finally {
-      rmSync(root, { recursive: true, force: true })
+      removeTree(root)
     }
   })
 
@@ -866,7 +1002,7 @@ describe('session cwd resolution over the API route', () => {
       expect(await invokeGet(file, downloadUrl({ sessionId: 'home' }, `~/${dirName}/note.txt`)))
         .toMatchObject({ status: 200, body: 'home sweet home' })
     } finally {
-      rmSync(dir, { recursive: true, force: true })
+      removeTree(dir)
     }
   })
 
@@ -897,7 +1033,7 @@ describe('session cwd resolution over the API route', () => {
       expect(htmlResult).toMatchObject({ status: 200 })
       expect(htmlResult.body).toContain('outside')
     } finally {
-      rmSync(root, { recursive: true, force: true })
+      removeTree(root)
     }
   })
 
@@ -920,7 +1056,7 @@ describe('session cwd resolution over the API route', () => {
       expect(res.headers['content-security-policy']).toContain('sandbox')
       expect(res.headers['x-content-type-options']).toBe('nosniff')
     } finally {
-      rmSync(root, { recursive: true, force: true })
+      removeTree(root)
     }
   })
 
@@ -941,7 +1077,7 @@ describe('session cwd resolution over the API route', () => {
       expect(res.headers['content-type']).toBe('image/png')
       expect(res.headers['content-security-policy']).toBeUndefined()
     } finally {
-      rmSync(root, { recursive: true, force: true })
+      removeTree(root)
     }
   })
 
@@ -954,7 +1090,7 @@ describe('session cwd resolution over the API route', () => {
       const tree = await invoke(route, 'fs.tree', { sessionId: 'security', path: join(workspace, 'missing') })
       expect(tree).toMatchObject({ ok: false, status: 400, error: { code: 'fs-error' } })
     } finally {
-      rmSync(root, { recursive: true, force: true })
+      removeTree(root)
     }
   })
 
@@ -984,7 +1120,7 @@ describe('session cwd resolution over the API route', () => {
       expect(levels[2]!.truncated).toBe(false)
       expect(levels[2]!.error).toMatch(/missing/)
     } finally {
-      rmSync(root, { recursive: true, force: true })
+      removeTree(root)
     }
   })
 
@@ -1005,7 +1141,7 @@ describe('session cwd resolution over the API route', () => {
       expect((single.value as unknown as { entries: Array<{ name: string }> }).entries.map(entry => entry.name))
         .toEqual(level.entries.map(entry => entry.name))
     } finally {
-      rmSync(root, { recursive: true, force: true })
+      removeTree(root)
     }
   })
 
@@ -1042,7 +1178,7 @@ describe('session cwd resolution over the API route', () => {
       const plainLevels = (plain.value as unknown as { levels: Array<{ entries: Array<{ name: string }> }> }).levels
       expect(plainLevels[0]!.entries.map(entry => entry.name)).toEqual(['src', 'third_party', '.DS_Store'])
     } finally {
-      rmSync(root, { recursive: true, force: true })
+      removeTree(root)
     }
   })
 
@@ -1071,7 +1207,7 @@ describe('session cwd resolution over the API route', () => {
       const anchored = await invoke(route, 'fs.search', { sessionId: 's-search', query: './src/index.ts' })
       expect(anchored.value).toEqual({ matches: [join(workspace, 'src', 'index.ts')], dirs: [], truncated: false })
     } finally {
-      rmSync(root, { recursive: true, force: true })
+      removeTree(root)
     }
   })
 
@@ -1089,7 +1225,56 @@ describe('session cwd resolution over the API route', () => {
       })
       expect(tooMany).toMatchObject({ ok: false, status: 400, error: { code: 'bad-request' } })
     } finally {
-      rmSync(root, { recursive: true, force: true })
+      removeTree(root)
+    }
+  })
+
+  it('fs.trees shares ONE probe gate across the batch levels', async () => {
+    const root = mkdtempSync(join(tmpdir(), 'dsh-sidebar-fs-trees-gate-'))
+    const workspace = join(root, 'workspace')
+    const level = join(workspace, 'level')
+    mkdirSync(level, { recursive: true })
+    for (let index = 0; index < 3; index += 1) {
+      mkdirSync(join(level, `only-${index}`))
+      writeFileSync(join(level, `only-${index}`, 'child.txt'), 'x')
+    }
+    try {
+      const route = mount({ sessions: { get: () => ({ header: { cwd: workspace } }) } })
+      const before = probeGateCalls.length
+      const answer = await invoke(route, 'fs.trees', { sessionId: 's-tree-gate', paths: [workspace, level] })
+      expect(answer.ok).toBe(true)
+      // ONE gate for the whole request: a per-level gate would let each level's
+      // probe pool run at full width, which is the runaway this bounds.
+      expect(probeGateCalls.length - before).toBe(1)
+      // The shared budget changed nothing about what the levels report. (The
+      // local `invoke` types `value` as its cwd probe, hence the double cast.)
+      const levels = (answer.value as unknown as {
+        levels: { path: string; entries: { compact?: boolean }[] }[]
+      }).levels
+      expect(levels.find(entry => entry.path === level)?.entries.filter(row => row.compact === true)).toHaveLength(3)
+    } finally {
+      removeTree(root)
+    }
+  })
+
+  it('fs.tree builds one probe gate for its single level', async () => {
+    const root = mkdtempSync(join(tmpdir(), 'dsh-sidebar-fs-tree-gate-'))
+    const workspace = join(root, 'workspace')
+    mkdirSync(join(workspace, 'only'), { recursive: true })
+    writeFileSync(join(workspace, 'only', 'child.txt'), 'x')
+    try {
+      const route = mount({ sessions: { get: () => ({ header: { cwd: workspace } }) } })
+      const before = probeGateCalls.length
+      const answer = await invoke(route, 'fs.tree', { sessionId: 's-tree-single-gate', path: workspace })
+      expect(answer.ok).toBe(true)
+      // The single-layer route is a probe-bounded request too: it lists ONE
+      // level, but that level runs the same per-row probes (`fs.trees` passes
+      // a gate for exactly this reason), so it must build one as well.
+      expect(probeGateCalls.length - before).toBe(1)
+      const entries = (answer.value as unknown as { entries: { compact?: boolean }[] }).entries
+      expect(entries.filter(entry => entry.compact === true)).toHaveLength(1)
+    } finally {
+      removeTree(root)
     }
   })
 
@@ -1108,7 +1293,7 @@ describe('session cwd resolution over the API route', () => {
       expect(tree.ok).toBe(true)
       expect((tree.value as unknown as { entries: Array<{ name: string }> }).entries.map(entry => entry.name)).toEqual(['secret.txt'])
     } finally {
-      rmSync(root, { recursive: true, force: true })
+      removeTree(root)
     }
   })
 
@@ -1126,7 +1311,7 @@ describe('session cwd resolution over the API route', () => {
       expect(read.ok).toBe(true)
       expect((read.value as unknown as { content: string }).content).toBe('secret')
     } finally {
-      rmSync(root, { recursive: true, force: true })
+      removeTree(root)
     }
   })
 
@@ -1144,10 +1329,45 @@ describe('session cwd resolution over the API route', () => {
       // The write landed on the link's TARGET (the link is not replaced).
       expect(readFileSync(join(outside, 'new.txt'), 'utf8')).toBe('hack')
     } finally {
-      rmSync(root, { recursive: true, force: true })
+      removeTree(root)
     }
   })
 })
+/**
+ * One save through `POST /sidebar/write`, resolved against the most recent
+ * mount (see {@link lastMountedRoutes}).
+ * @param payload - `{ sessionId, cwd?, path, content, expectedMtimeMs? }`.
+ * @returns the parsed envelope.
+ */
+const invokeRawWrite = async (payload: unknown): Promise<{
+  ok: boolean
+  value?: unknown
+  error?: { code?: string; message: string }
+}> => {
+  const route = lastMountedRoutes.find(candidate => candidate.path === '/sidebar/write')
+  if (route === undefined) throw new Error('test setup: no /sidebar/write route was mounted')
+  const record = payload as { sessionId: string; cwd?: string; path: string; content?: unknown; expectedMtimeMs?: number }
+  const params = new URLSearchParams({ sessionId: record.sessionId, path: record.path })
+  if (record.cwd !== undefined) params.set('cwd', record.cwd)
+  if (record.expectedMtimeMs !== undefined) params.set('expectedMtimeMs', String(record.expectedMtimeMs))
+  const body = Buffer.from(String(record.content ?? ''), 'utf8')
+  const req = {
+    method: 'POST',
+    url: `/sidebar/write?${params.toString()}`,
+    headers: { host: '127.0.0.1:3080' },
+    [Symbol.asyncIterator]: async function* () { yield body },
+  } as never
+  const out: { status: number; body: string } = { status: 200, body: '' }
+  const res = {
+    headersSent: false,
+    writeHead: (status: number) => { out.status = status },
+    write: () => true,
+    end: (chunk: unknown) => { out.body += String(chunk ?? '') },
+  } as never
+  await route.handler(req, res)
+  return JSON.parse(out.body) as { ok: boolean; error?: { code?: string; message: string } }
+}
+
 /**
  * Invoke one `/sidebar/api/<method>` route against a fake Socket-ish pair.
  * @param route - the mounted prefix route.
@@ -1160,6 +1380,10 @@ const invoke = async (route: SidebarWebRoute, method: string, payload: unknown):
   value?: unknown
   error?: { code?: string; message: string }
 }> => {
+  // The editor save is its own raw route now (the document IS the body), so it
+  // is dispatched rather than posted to `/sidebar/api`. Both `invoke` helpers
+  // in this file do this; see `lastMountedRoutes` for how the route is found.
+  if (method === 'fs.write') return await invokeRawWrite(payload)
   const body = Buffer.from(JSON.stringify(payload))
   const req = {
     method: 'POST',
@@ -1227,8 +1451,9 @@ const createFakeSettings = (pre?: Record<string, Record<string, unknown>>) => {
  */
 const mountWithSettings = (settings?: unknown, home?: string): SidebarWebRoute => {
   const routes: SidebarWebRoute[] = []
+  lastMountedRoutes = routes
   const ctx = {
-    webRuntime: { trustedHosts: [] },
+    webStartup: { trustedHosts: [] },
     webServer: {
       register: (route: SidebarWebRoute) => { routes.push(route); return () => {} },
       registerUpgrade: (route: SidebarWebUpgradeRoute) => { void route; return () => {} },
@@ -1374,7 +1599,7 @@ describe('side card settings routes', () => {
       expect(row?.value).not.toHaveProperty('browserInterceptHttp')
       expect(row?.revision).toBe(1)
     } finally {
-      rmSync(home, { recursive: true, force: true })
+      removeTree(home)
     }
   })
 
@@ -1391,7 +1616,7 @@ describe('side card settings routes', () => {
       expect(row?.value).toMatchObject({ editorExplorer: true, agentOpenTools: false })
       expect(row?.revision).toBe(0)
     } finally {
-      rmSync(home, { recursive: true, force: true })
+      removeTree(home)
     }
   })
 
@@ -1412,7 +1637,7 @@ describe('side card settings routes', () => {
       const tree = await invoke(route, 'fs.tree', { sessionId: 'fence', cwd: workspace, path: outside })
       expect(tree).toMatchObject({ ok: true })
       const write = await invoke(route, 'fs.write', { sessionId: 'fence', cwd: workspace, path: join(outside, 'written.txt'), content: 'ok' })
-      expect(write).toMatchObject({ ok: true })
+      expect(write, JSON.stringify(write)).toMatchObject({ ok: true })
       expect(readFileSync(join(outside, 'written.txt'), 'utf8')).toBe('ok')
       // A legacy `workspaceFence: true` patch is just an unknown prefs key now
       // (the schema no longer declares it): it must not fail the write and must
@@ -1422,7 +1647,7 @@ describe('side card settings routes', () => {
       const stillOpen = await invoke(route, 'fs.read', { sessionId: 'fence', cwd: workspace, path: join(outside, 'secret.txt') })
       expect(stillOpen).toMatchObject({ ok: true })
     } finally {
-      rmSync(root, { recursive: true, force: true })
+      removeTree(root)
     }
   })
 
@@ -1468,7 +1693,7 @@ describe('agent sidebar-open tool gating', () => {
       configure: () => () => {},
     }
     const ctx = {
-      webRuntime: { trustedHosts: [] },
+      webStartup: { trustedHosts: [] },
       webServer: {
         register: (route: SidebarWebRoute) => { routes.push(route); return () => {} },
         registerUpgrade: (route: SidebarWebUpgradeRoute) => { void route; return () => {} },

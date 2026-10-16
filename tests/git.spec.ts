@@ -1,5 +1,5 @@
 import { execFile, execFileSync } from 'node:child_process'
-import { mkdirSync, mkdtempSync, readFileSync, realpathSync, rmSync, writeFileSync } from 'node:fs'
+import { mkdirSync, mkdtempSync, readFileSync, realpathSync, writeFileSync } from 'node:fs'
 import { mkdir, mkdtemp, rm } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
@@ -7,6 +7,7 @@ import { promisify } from 'node:util'
 import { describe, expect, it } from 'vitest'
 import { parseUnifiedDiff } from '../src/client/diff/rows.ts'
 import { checkout, parseLogLines, parseNumstat, parsePorcelainZ, repoRoots, status } from '../src/git.ts'
+import { removeTree } from './temp-tree.ts'
 
 const execFileAsync = promisify(execFile)
 const normalizePath = (path: string): string => path.replaceAll('\\', '/')
@@ -78,7 +79,7 @@ describe('git parsing', () => {
       expect(paths).toContain('newdir/a.ts')
       expect(paths.some(path => path.endsWith('/'))).toBe(false)
     } finally {
-      rmSync(root, { recursive: true, force: true })
+      removeTree(root)
     }
   })
 
@@ -97,7 +98,7 @@ describe('git parsing', () => {
       expect(result.entries).toHaveLength(2_000)
       expect(result.truncated).toBe(true)
     } finally {
-      rmSync(root, { recursive: true, force: true })
+      removeTree(root)
     }
   })
 
@@ -110,7 +111,7 @@ describe('git parsing', () => {
       expect(result.entries).toHaveLength(3)
       expect(result.truncated).toBe(false)
     } finally {
-      rmSync(root, { recursive: true, force: true })
+      removeTree(root)
     }
   })
 
@@ -294,7 +295,7 @@ describe('git parsing', () => {
       expect(execFileSync('git', ['rev-parse', '--abbrev-ref', 'HEAD'], { cwd: root, encoding: 'utf8' }).trim())
         .toBe('other')
     } finally {
-      rmSync(root, { recursive: true, force: true })
+      removeTree(root)
     }
   })
 })
@@ -404,7 +405,7 @@ describe('numstat line counts (#131)', () => {
       expect(byPath.get('untracked.txt')).toEqual({ path: 'untracked.txt', xy: '??' })
       expect(byPath.has('renamed.txt')).toBe(false)
     } finally {
-      rmSync(root, { recursive: true, force: true })
+      removeTree(root)
     }
   })
 })

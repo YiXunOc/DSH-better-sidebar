@@ -71,19 +71,28 @@ function isTrustedAuthority(hostUrl: URL, trustedHosts: readonly string[]): bool
   })
 }
 
+function isBindAddressAuthority(hostUrl: URL, bindHost: string | undefined): boolean {
+  if (bindHost === undefined) return false
+  const zoneAt = bindHost.indexOf('%')
+  const address = zoneAt === -1 ? bindHost : bindHost.slice(0, zoneAt)
+  const bindUrl = parseAuthority(address.includes(':') ? `[${address}]` : address)
+  return bindUrl !== undefined && bindUrl.hostname === hostUrl.hostname
+}
+
 /**
  * Decide whether one sidebar request may reach the plugin routes.
  * @param request - node HTTP request facts (headers, and the method/url the
  *   media-route exception is scoped to).
- * @param trustedHosts - non-loopback authorities this deployment serves.
+ * @param trustedHosts - explicit non-loopback authorities this deployment serves.
+ * @param bindHost - listener's concrete IP literal, admitted independently.
  * @returns true when the Host is ours (loopback or trusted) and browser markers are same-origin.
  */
-export function isTrustedApiRequest(request: ApiTrustRequest, trustedHosts: readonly string[]): boolean {
+export function isTrustedApiRequest(request: ApiTrustRequest, trustedHosts: readonly string[], bindHost?: string): boolean {
   const host = header(request.headers, 'host')
   if (host === undefined) return false
   const hostUrl = parseAuthority(host)
   if (hostUrl === undefined) return false
-  if (!isLoopbackHostname(hostUrl.hostname) && !isTrustedAuthority(hostUrl, trustedHosts)) return false
+  if (!isLoopbackHostname(hostUrl.hostname) && !isTrustedAuthority(hostUrl, trustedHosts) && !isBindAddressAuthority(hostUrl, bindHost)) return false
   const fetchSite = header(request.headers, 'sec-fetch-site')
   if (fetchSite === 'cross-site') {
     // Chromium can restore a same-origin image from bfcache with a stale

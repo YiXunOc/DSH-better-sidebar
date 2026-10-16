@@ -1,8 +1,8 @@
 /**
  * Remote-access trust regression tests: the /sidebar fence must accept a
- * reverse-proxy domain or LAN IP listed in the DSH web runtime's
- * `webRuntime.trustedHosts` — the same trust list the /api gateway accepts
- * (LAN IP literals sampled at bind plus `--trusted-host` authorities).
+ * reverse-proxy domain or LAN IP listed in the DSH web startup's
+ * `webStartup.trustedHosts` — the same trust list the /api gateway accepts
+ * (`--trusted-host` authorities; the listener bind IP is admitted separately).
  *
  * Regression: the fence used to read the connection row's trustedHosts
  * through the Loader (`entry.options.name === 'connection'`, which never
@@ -15,12 +15,14 @@
  * name.
  */
 import { describe, expect, it } from 'vitest'
-import { mkdtempSync, rmSync, writeFileSync } from 'node:fs'
+import { mkdtempSync, writeFileSync } from 'node:fs'
+import { Writable } from 'node:stream'
 import type { IncomingMessage, ServerResponse } from 'node:http'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { apply } from '../src/index.ts'
 import type { SidebarWebRoute, SidebarWebUpgradeRoute } from '../src/context-types.ts'
+import { removeTree } from './temp-tree.ts'
 
 interface FakeRes {
   status: number
@@ -30,19 +32,44 @@ interface FakeRes {
   end(body?: string | Buffer): void
 }
 
+/**
+ * The response face these fence assertions read, backed by a REAL Writable.
+ *
+ * `/sidebar/file` STREAMS now (`createReadStream` → `pipeline` into the
+ * response), and `pipeline` needs an actual writable destination rather than a
+ * plain object with an `end`. The status/header/body facade the assertions use
+ * is layered on the same object, so the media cases keep reading exactly what
+ * they read before.
+ */
 function fakeRes(): FakeRes {
-  return {
-    status: 0,
-    headers: {},
-    body: '',
-    writeHead(status, headers = {}) {
-      this.status = status
-      this.headers = headers
+  const chunks: Buffer[] = []
+  const stream = new Writable({
+    write(chunk: Buffer, _encoding, callback) {
+      chunks.push(Buffer.from(chunk))
+      callback()
     },
-    end(body) {
-      if (body !== undefined) this.body = body.toString()
-    },
-  } as FakeRes
+  })
+  // Captured BEFORE the facade shadows the method: `facade === stream`, so
+  // calling `stream.end()` from the replacement would recurse into itself.
+  const finishStream = Writable.prototype.end.bind(stream)
+  const facade = stream as unknown as FakeRes
+  facade.status = 0
+  facade.headers = {}
+  facade.body = ''
+  const collect = (): void => { facade.body = Buffer.concat(chunks).toString('utf8') }
+  facade.writeHead = (status, headers = {}) => {
+    facade.status = status
+    facade.headers = headers
+  }
+  facade.end = (body) => {
+    if (body !== undefined) chunks.push(Buffer.from(body))
+    collect()
+    finishStream()
+  }
+  // `stream.end()` from the pipeline path never goes through `facade.end`, so
+  // the body is also harvested once the writable finishes.
+  stream.on('finish', collect)
+  return facade
 }
 
 function req(
@@ -62,8 +89,8 @@ function req(
   } as unknown as IncomingMessage
 }
 
-/** Mount apply() against a fake context with a replaceable webRuntime trust list. */
-function mount(initialTrustedHosts: readonly string[] = []): {
+/** Mount apply() against a fake context with a replaceable webStartup trust list. */
+function mount(initialTrustedHosts: readonly string[] = [], bindHost?: string): {
   api: (r: IncomingMessage, s: ServerResponse) => Promise<void>
   upgrade: (path: string) => SidebarWebUpgradeRoute['handler']
   media: (r: IncomingMessage, s: ServerResponse) => Promise<void>
@@ -75,8 +102,9 @@ function mount(initialTrustedHosts: readonly string[] = []): {
   const upgrades: SidebarWebUpgradeRoute[] = []
   const effects: Array<() => void | (() => void)> = []
   const ctx = {
-    webRuntime: runtime,
+    webStartup: runtime,
     webServer: {
+      host: bindHost,
       register: (route: SidebarWebRoute) => { routes.push(route); return () => {} },
       registerUpgrade: (route: SidebarWebUpgradeRoute) => { upgrades.push(route); return () => {} },
     },
@@ -127,8 +155,8 @@ function lanRequest(): IncomingMessage {
   }, '{"sessionId":"test-session"}')
 }
 
-describe('remote-access trust (webRuntime.trustedHosts)', () => {
-  it('accepts a reverse-proxy domain configured in webRuntime.trustedHosts', async () => {
+describe('remote-access trust (webStartup.trustedHosts)', () => {
+  it('accepts a reverse-proxy domain configured in webStartup.trustedHosts', async () => {
     const { api, cleanup } = mount(['example.com'])
     try {
       const res = fakeRes()
@@ -139,7 +167,7 @@ describe('remote-access trust (webRuntime.trustedHosts)', () => {
     }
   })
 
-  it('accepts LAN IP literals from webRuntime.trustedHosts', async () => {
+  it('accepts LAN IP literals from webStartup.trustedHosts', async () => {
     const { api, cleanup } = mount(['192.0.2.1'])
     try {
       const res = fakeRes()
@@ -150,7 +178,7 @@ describe('remote-access trust (webRuntime.trustedHosts)', () => {
     }
   })
 
-  it('stays loopback-only when webRuntime.trustedHosts is empty', async () => {
+  it('stays loopback-only when webStartup.trustedHosts is empty', async () => {
     const { api, cleanup } = mount([])
     try {
       const remote = fakeRes()
@@ -248,7 +276,7 @@ describe('remote-access trust (webRuntime.trustedHosts)', () => {
       return { status: res.status, headers: res.headers }
     } finally {
       cleanup()
-      rmSync(directory, { recursive: true, force: true })
+      removeTree(directory)
     }
   }
 
@@ -304,7 +332,7 @@ describe('remote-access trust (webRuntime.trustedHosts)', () => {
   })
 
 
-  it('reads webRuntime.trustedHosts per request, not once at apply', async () => {
+  it('reads webStartup.trustedHosts per request, not once at apply', async () => {
     const { api, setTrustedHosts, cleanup } = mount([])
     try {
       const before = fakeRes()
@@ -316,6 +344,20 @@ describe('remote-access trust (webRuntime.trustedHosts)', () => {
       const after = fakeRes()
       await api(remoteDomainRequest(), after as unknown as ServerResponse)
       expect(after.status).toBe(200)
+    } finally {
+      cleanup()
+    }
+  })
+
+  it('admits only the concrete webServer bind IP without an explicit trust entry', async () => {
+    const { api, cleanup } = mount([], '10.0.0.7')
+    try {
+      const bound = fakeRes()
+      await api(req('POST', '/sidebar/api/session.cwd', { host: '10.0.0.7:3080' }, '{"sessionId":"test-session"}'), bound as unknown as ServerResponse)
+      expect(bound.status).toBe(200)
+      const other = fakeRes()
+      await api(req('POST', '/sidebar/api/session.cwd', { host: '10.0.0.8:3080' }, '{"sessionId":"test-session"}'), other as unknown as ServerResponse)
+      expect(other.status).toBe(403)
     } finally {
       cleanup()
     }

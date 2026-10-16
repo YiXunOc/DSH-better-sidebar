@@ -6,7 +6,7 @@ const { spawnMock } = vi.hoisted(() => ({ spawnMock: vi.fn() }))
 
 vi.mock('node:child_process', () => ({ spawn: spawnMock }))
 
-import { isGitRepo, worktrees } from '../src/git.ts'
+import { isGitRepo, runGit, worktrees } from '../src/git.ts'
 
 afterEach(() => {
   spawnMock.mockReset()
@@ -98,5 +98,67 @@ describe('git subprocess spawning', () => {
       return args.includes('worktree') && args.includes('-z')
     })
     expect(nulAttempts).toHaveLength(1)
+  })
+})
+
+/**
+ * The two output caps, pinned against a MOCKED child — the only way to make
+ * "production stopped" deterministic. Against a real `git` the answer is a
+ * race: the killed child may already have written its whole output into the
+ * pipe, so the retained text legitimately still contained every row (CI red:
+ * a capped 2,500-row status returned all 2,500 fields). Here we control both
+ * the crossing chunk AND the tail that arrives after the kill.
+ */
+describe('git output caps', () => {
+  /** A child whose stdout is driven by the test, with a spy on `kill`. */
+  function controlledChild(script: (stdout: PassThrough, child: EventEmitter) => void): {
+    spawn: () => EventEmitter
+    kill: ReturnType<typeof vi.fn>
+  } {
+    const kill = vi.fn()
+    return {
+      kill,
+      spawn: () => {
+        const child = new EventEmitter()
+        const stdout = new PassThrough()
+        const stderr = new PassThrough()
+        Object.assign(child, { stdout, stderr, kill })
+        queueMicrotask(() => { script(stdout, child) })
+        return child
+      },
+    }
+  }
+
+  it('stops retaining output once the NUL field cap is reached', async () => {
+    const field = (letter: string): string => `${letter.repeat(10)}\0`
+    const child = controlledChild((stdout, proc) => {
+      stdout.write(field('a').repeat(3)) // crosses the cap of 2 → kill
+      // The killed child's already-buffered tail must NOT reach the caller.
+      setImmediate(() => {
+        stdout.write(field('b').repeat(50))
+        stdout.end()
+        proc.emit('close', null) // killed by a signal, not a clean exit
+      })
+    })
+    spawnMock.mockImplementation(child.spawn)
+
+    const out = await runGit('/repo', ['status'], 30_000, { maxNulFields: 2 })
+
+    expect(child.kill).toHaveBeenCalledTimes(1)
+    expect(out).toBe(field('a').repeat(3))
+    expect(out).not.toContain('bbbbbbbbbb')
+  })
+
+  it('kills the child and rejects when stdout exceeds the byte cap', async () => {
+    const child = controlledChild((stdout, proc) => {
+      stdout.write(Buffer.alloc(64, 0x78))
+      stdout.end()
+      proc.emit('close', 0)
+    })
+    spawnMock.mockImplementation(child.spawn)
+
+    await expect(runGit('/repo', ['log'], 30_000, { maxBytes: 32 }))
+      .rejects.toThrow(/output exceeded 32 bytes/)
+    expect(child.kill).toHaveBeenCalledTimes(1)
   })
 })

@@ -47,7 +47,7 @@ e2e_require_cmd() {
 # `@next`/`@alpha` 之类的 dist-tag**：0.1.7-rc.1 上线时 `alpha` 指的是
 # 0.1.7-alpha.2，0.2.0-rc.2 又只挂在 `next` 上。钉版必须与 package.json 的
 # peer 下限同步（caret 跨 minor 不成立：`^0.1.7-rc.1` 实测不满足 0.2.0-rc.2）。
-DSH_NPX_SPEC="${DSH_NPX_SPEC:-@deepseek-ai/dsh@0.2.0-rc.2}"
+DSH_NPX_SPEC="${DSH_NPX_SPEC:-@deepseek-ai/dsh@0.2.1-alpha.4}"
 e2e_resolve_dsh_cmd() {
   local explicit="${DSH_CMD}"
   if ! command -v "$DSH_CMD" >/dev/null 2>&1; then
@@ -69,7 +69,7 @@ e2e_resolve_dsh_cmd() {
 # 己在挂什么），只告警。
 e2e_check_dsh_version() {
   local explicit="$1" actual expected
-  expected="${DSH_EXPECT_VERSION:-0.2.0-rc.2}"
+  expected="${DSH_EXPECT_VERSION:-0.2.1-alpha.4}"
   # `dsh --version` 冷启动要走 npx，给足预算；拿不到版本就只告警。
   actual="$($DSH_CMD --version 2>/dev/null | tr -d '[:space:]' | head -c 64 || true)"
   case "$actual" in

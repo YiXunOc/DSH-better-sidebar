@@ -15,11 +15,12 @@
 
 import { describe, expect, it } from 'vitest'
 import { spawnSync } from 'node:child_process'
-import { mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs'
+import { mkdtempSync, readFileSync, writeFileSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { apply } from '../src/index.ts'
 import type { SidebarWebRoute, SidebarWebUpgradeRoute } from '../src/context-types.ts'
+import { removeTree } from './temp-tree.ts'
 
 /** Fixture commit identity, confined to this process: no git config is touched. */
 const FIXTURE_IDENTITY = {
@@ -90,7 +91,7 @@ function makeRemoteFixture(): RemoteFixture {
 function mount(): { route: SidebarWebRoute } {
   const routes: SidebarWebRoute[] = []
   const ctx = {
-    webRuntime: { trustedHosts: [] },
+    webStartup: { trustedHosts: [] },
     webServer: {
       register: (route: SidebarWebRoute) => { routes.push(route); return () => {} },
       registerUpgrade: (_route: SidebarWebUpgradeRoute) => () => {},
@@ -148,7 +149,7 @@ describe('git remote routes (real repository + bare origin)', () => {
       // The remote actually moved — the route ran a real `git push`.
       expect(gitRun(fixture.origin, ['rev-parse', 'main']).trim()).toBe(local)
     } finally {
-      rmSync(fixture.scratch, { recursive: true, force: true })
+      removeTree(fixture.scratch)
     }
   })
 
@@ -164,7 +165,7 @@ describe('git remote routes (real repository + bare origin)', () => {
       expect(result.error?.code).toBe('git-error')
       expect(result.error?.message ?? '').not.toBe('')
     } finally {
-      rmSync(dir, { recursive: true, force: true })
+      removeTree(dir)
     }
   })
 
@@ -182,7 +183,7 @@ describe('git remote routes (real repository + bare origin)', () => {
       expect(pulled).toMatchObject({ ok: true, value: { ok: true } })
       expect(readFileSync(join(fixture.work, 'b.txt'), 'utf8')).toBe('from peer\n')
     } finally {
-      rmSync(fixture.scratch, { recursive: true, force: true })
+      removeTree(fixture.scratch)
     }
   })
 
@@ -209,7 +210,7 @@ describe('git remote routes (real repository + bare origin)', () => {
       expect(gitRun(fixture.work, ['status', '--porcelain'])).toBe('')
       expect(() => readFileSync(join(fixture.work, '.git', 'MERGE_HEAD'), 'utf8')).toThrow()
     } finally {
-      rmSync(fixture.scratch, { recursive: true, force: true })
+      removeTree(fixture.scratch)
     }
   })
 })
